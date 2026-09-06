@@ -1,209 +1,826 @@
-# self_play.py
-import sys
-import os
+"""Train a new policy/value model from random initialization.
+
+Old checkpoints are intentionally neither loaded nor resumed.
+MCTS uses neural surrogate values during tree search, while the final
+placement of every episode is evaluated by the physical optimization
+model.
+"""
+
+import argparse
+import csv
+import random
+from datetime import datetime, timezone
+from pathlib import Path
+from time import perf_counter
+
+import numpy as np
 import torch
-import logging
-import math
-import pandas as pd
-import torch.optim as optim
-import pyomo.environ as pyo
 
-current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.dirname(current_dir)
-if project_root not in sys.path:
-    sys.path.insert(0, project_root)
-
-from env.aps_env import ActivePlanningEnv
 from core.mcts import MCTS
 from core.network import ADNDeepNet
 from core.replay_buffer import ReplayBuffer
+from data.devices import (
+    MAX_LOAD_SHEDDING_MWH_REP,
+    MAX_RES_CURTAILMENT_MWH_REP,
+)
+from env.aps_env import ActivePlanningEnv
+from optimization.solver import evaluate_placement
 
-logging.getLogger('pyomo.core').setLevel(logging.ERROR)
 
-def verify_exact_physics(model):
-    
-    try:
-        max_gap = 0.0
-        from data.ieee33 import BRANCHES
-        for k in model.E:
-            for t in model.T:
-                fb = BRANCHES[k]['from']
-                l_val = pyo.value(model.l[k, t])
-                v_val = pyo.value(model.v[fb, t])
-                P_val = pyo.value(model.P[k, t])
-                Q_val = pyo.value(model.Q[k, t])
-                
-                gap = abs((l_val * v_val) - (P_val**2 + Q_val**2))
-                if gap > max_gap:
-                    max_gap = gap
-        return max_gap
-    except Exception:
-        return -1.0
+ARCHITECTURE_VERSION = "corrected-v5"
 
-def calculate_performance_index(model):
-    perf = 0.0
-    for i in model.N:
-        for t in model.T:
-            perf += pyo.value(model.v_viol_down[i, t]) + pyo.value(model.v_viol_up[i, t])
-    return max(0.0, perf)
 
-def self_play(start_ep=0, total_eps=200, resume_model=None):
+LOG_FIELDS = (
+    "episode",
+    "seed",
+    "moves",
+    "selected_stop",
+    "terminal_value",
+    "solver_ok",
+    "compliant",
+    "sample_used",
+    "economic_cost",
+    "cost_change_percent_vs_base",
+    "objective_cost",
+    "penalty_cost",
+    "placement",
+    "placement_ieee",
+    "termination_condition",
+    "failure_reasons",
+    "max_cone_abs_gap",
+    "nonexact_cone_points",
+    "min_voltage_pu",
+    "res_curtailment_mwh_representative",
+    "load_shedding_mwh_representative",
+    "valid_episodes_cumulative",
+    "invalid_episodes_cumulative",
+    "replay_samples",
+    "optimizer_updates_cumulative",
+    "physics_solves_cumulative",
+    "episode_elapsed_seconds",
+    "loss_total",
+)
+
+
+def set_global_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def performance_target(result):
+    summary = result["compliance"]["summary"]
+
+    res = float(
+        summary.get(
+            "res_curtailment_mwh_representative",
+            float("inf"),
+        )
+    )
+
+    load = float(
+        summary.get(
+            "load_shedding_mwh_representative",
+            float("inf"),
+        )
+    )
+
+    res_target = (
+        1.0
+        if not np.isfinite(res)
+        else float(
+            np.clip(
+                res / MAX_RES_CURTAILMENT_MWH_REP,
+                0.0,
+                1.0,
+            )
+        )
+    )
+
+    load_target = (
+        1.0
+        if not np.isfinite(load)
+        else float(
+            np.clip(
+                load / MAX_LOAD_SHEDDING_MWH_REP,
+                0.0,
+                1.0,
+            )
+        )
+    )
+
+    return np.array(
+        [res_target, load_target],
+        dtype=np.float32,
+    )
+
+
+def validate_training_arguments(
+    episodes,
+    simulations,
+    max_moves,
+    batch_size,
+    updates_per_episode,
+    checkpoint_interval,
+):
+    if int(episodes) < 1:
+        raise ValueError(
+            "episodes must be at least 1."
+        )
+
+    if int(simulations) < 1:
+        raise ValueError(
+            "simulations must be at least 1."
+        )
+
+    if int(max_moves) < 1:
+        raise ValueError(
+            "max_moves must be at least 1."
+        )
+
+    if int(batch_size) < 1:
+        raise ValueError(
+            "batch_size must be at least 1."
+        )
+
+    if int(updates_per_episode) < 0:
+        raise ValueError(
+            "updates_per_episode cannot be negative."
+        )
+
+    if int(checkpoint_interval) < 0:
+        raise ValueError(
+            "checkpoint_interval cannot be negative."
+        )
+
+
+def build_checkpoint_payload(
+    *,
+    network,
+    optimizer,
+    seed,
+    episode,
+    configured_episodes,
+    valid_episodes,
+    invalid_episodes,
+    replay_samples,
+    optimizer_updates,
+    base_economic_cost,
+    simulations,
+    max_moves,
+    batch_size,
+    updates_per_episode,
+    stop_prior_floor,
+):
+    return {
+        "architecture_version": ARCHITECTURE_VERSION,
+        "seed": int(seed),
+        "episode_completed": int(episode),
+        "configured_episodes": int(
+            configured_episodes
+        ),
+        "valid_episodes": int(valid_episodes),
+        "invalid_episodes": int(
+            invalid_episodes
+        ),
+        "replay_samples": int(replay_samples),
+        "optimizer_updates": int(
+            optimizer_updates
+        ),
+        "base_reference_economic_cost": float(
+            base_economic_cost
+        ),
+        "simulations": int(simulations),
+        "max_moves": int(max_moves),
+        "batch_size": int(batch_size),
+        "updates_per_episode": int(
+            updates_per_episode
+        ),
+        "stop_prior_floor": float(
+            stop_prior_floor
+        ),
+        "exact_terminal_during_mcts": False,
+        "state_dict": network.state_dict(),
+        "optimizer_state_dict": (
+            optimizer.state_dict()
+        ),
+        "resumable_with_exact_replay_state": False,
+    }
+
+
+def save_checkpoint_atomic(path, payload):
+    temporary_path = path.with_suffix(
+        path.suffix + ".tmp"
+    )
+
+    torch.save(
+        payload,
+        temporary_path,
+    )
+
+    temporary_path.replace(path)
+
+
+def train_from_scratch(
+    episodes=400,
+    simulations=500,
+    max_moves=32,
+    seed=0,
+    batch_size=32,
+    updates_per_episode=4,
+    output_dir="models",
+    checkpoint_interval=10,
+    stop_prior_floor=0.05,
+):
+    validate_training_arguments(
+        episodes=episodes,
+        simulations=simulations,
+        max_moves=max_moves,
+        batch_size=batch_size,
+        updates_per_episode=updates_per_episode,
+        checkpoint_interval=checkpoint_interval,
+    )
+
+    episodes = int(episodes)
+    simulations = int(simulations)
+    max_moves = int(max_moves)
+    seed = int(seed)
+    batch_size = int(batch_size)
+    updates_per_episode = int(
+        updates_per_episode
+    )
+    checkpoint_interval = int(
+        checkpoint_interval
+    )
+    stop_prior_floor = float(
+        stop_prior_floor
+    )
+
+    set_global_seed(seed)
+
+    output = Path(output_dir)
+    output.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    stamp = datetime.now(
+        timezone.utc
+    ).strftime("%Y%m%dT%H%M%SZ")
+
+    log_path = (
+        output
+        / (
+            f"training_{ARCHITECTURE_VERSION}"
+            f"_seed{seed}_{stamp}.csv"
+        )
+    )
+
     env = ActivePlanningEnv()
-    net = ADNDeepNet(num_buses=33, num_device_types=4)
-    optimizer = optim.Adam(net.parameters(), lr=0.001, weight_decay=1e-4) 
-    
-    buffer = ReplayBuffer(capacity=10000) 
-    checkpoint_interval = 50 
-    
-    INITIAL_TEMP = 1.0
-    MIN_TEMP = 0.1
-    DECAY_RATE = 0.98 
-    
-    training_history = []
-    
-    print("==================================================")
-    print("   Starting AlphaZero Self-Play Training Loop")
-    print("   Physics Engine: Convex SOCP Relaxation (DistFlow)")
-    print(f"  Target Episodes: {start_ep + 1} to {total_eps}")
-    print("==================================================\n")
 
-    if resume_model and os.path.exists(resume_model):
-        net.load_state_dict(torch.load(resume_model, weights_only=True))
-        print(f" [*] SUCCESSFULLY LOADED WEIGHTS FROM: {resume_model}\n")
-    else:
-        print(f" [*] Starting fresh from scratch. No previous weights loaded.\n")
+    base = evaluate_placement(
+        env.model,
+        {},
+        hard_verify=False,
+    )
 
-    print("  Evaluating Base Network for Reward Scaling...")
-    empty_placement = {'ess': [], 'pv': [], 'gas': [], 'svc': [], 'cb': []}
-    is_base_feasible, base_cost = env.base_model_evaluate(empty_placement)
-    base_violations = calculate_performance_index(env.base_model)
-    print(f"  --> BASE NETWORK VIOLATIONS (NO AI): {base_violations:.4f}")
+    base_is_valid = bool(
+        base["solver_ok"]
+        and base["is_compliant"]
+        and np.isfinite(
+            base["economic_cost"]
+        )
+    )
 
-    min_v = 1.5
-    for i in env.base_model.N:
-        for t in env.base_model.T:
-            v_val = math.sqrt(pyo.value(env.base_model.v[i, t]))
-            if v_val < min_v:
-                min_v = v_val
-    print(f"  --> BASE NETWORK MIN VOLTAGE: {min_v:.4f} p.u.")
-    print("--------------------------------------------------")
-    
-    if not is_base_feasible or base_cost > 10000000:
-        base_cost = 46000000.0
-    print(f"   Base Cost established at: ${base_cost:,.2f}")
-    print("--------------------------------------------------")
+    if not base_is_valid:
+        reason = base[
+            "compliance"
+        ]["summary"].get(
+            "failure_reasons",
+            "",
+        )
 
-    for ep in range(start_ep, total_eps):
-        print(f"\n--- Episode {ep+1}/{total_eps} ---")
-        state = env.reset()
-        
-        current_temp = max(MIN_TEMP, INITIAL_TEMP * (DECAY_RATE ** (ep - start_ep)))
-        print(f"  Current MCTS Temperature: {current_temp:.3f}")
-        
-        mcts = MCTS(neural_net=net, num_simulations=400)
-        episode_memory = []
-        step = 0
-        final_cost = 0.0 
-        actual_perf = 100.0
-        gap = 1.0 
-        
-        while True:
-            best_action, action_probs = mcts.search(state, temperature=current_temp, add_noise=True)
-            
-            if best_action is None:
-                print("       No valid actions left. Ending episode.")
-                break
-                
-            state_tensor = mcts.state_to_tensor(state)
-            episode_memory.append([state_tensor, action_probs, best_action, 0.0])
+        raise RuntimeError(
+            "The common base-case solve failed or was "
+            "physically noncompliant; training cannot "
+            "define its reward reference. "
+            f"Reason: {reason}"
+        )
 
-            if best_action[0] == 'stop':
-                print(f"       [Step {step+1}] AI chosen action -> STOP INVESTING")
+    base_economic_cost = float(
+        base["economic_cost"]
+    )
+
+    env.set_reference_economic_cost(
+        base_economic_cost
+    )
+
+    network = ADNDeepNet()
+
+    optimizer = torch.optim.Adam(
+        network.parameters(),
+        lr=1.0e-4,
+        weight_decay=1.0e-4,
+    )
+
+    replay = ReplayBuffer(
+        capacity=10_000
+    )
+
+    rng = np.random.default_rng(seed)
+
+    valid_episodes = 0
+    invalid_episodes = 0
+    optimizer_updates = 0
+    final_checkpoint = None
+
+    with log_path.open(
+        "w",
+        newline="",
+        encoding="utf-8",
+    ) as log_handle:
+        writer = csv.DictWriter(
+            log_handle,
+            fieldnames=LOG_FIELDS,
+        )
+
+        writer.writeheader()
+        log_handle.flush()
+
+        for episode in range(
+            1,
+            episodes + 1,
+        ):
+            episode_start = perf_counter()
+
+            state = env.reset()
+            trajectory = []
+            stopped = False
+
+            for move in range(max_moves):
+                search = MCTS(
+                    neural_net=network,
+                    terminal_evaluator=(
+                        env.evaluate_terminal_value
+                    ),
+                    num_simulations=simulations,
+                    rng=rng,
+                    exact_terminal_evaluation=False,
+                    stop_prior_floor=(
+                        stop_prior_floor
+                    ),
+                )
+
+                temperature = (
+                    1.0
+                    if move < 10
+                    else 0.1
+                )
+
+                action, policy = search.search(
+                    state,
+                    temperature=temperature,
+                    add_noise=True,
+                )
+
+                trajectory.append(
+                    (
+                        search.state_to_tensor(
+                            state
+                        ),
+                        policy,
+                    )
+                )
+
+                if action[0] == "stop":
+                    stopped = True
+                    break
+
+                if not state.add_device(
+                    *action
+                ):
+                    break
+
+            # This is the only exact physical solve associated
+            # with the current self-play episode.
+            terminal = (
+                env.evaluate_terminal_state(
+                    state,
+                    force_solve=True,
+                )
+            )
+
+            terminal_value = float(
+                terminal["terminal_value"]
+            )
+
+            sample_used = bool(
+                terminal["solver_ok"]
+                and np.isfinite(
+                    terminal[
+                        "economic_cost"
+                    ]
+                )
+                and np.isfinite(
+                    terminal_value
+                )
+            )
+
+            losses = None
+
+            if sample_used:
+                perf = performance_target(
+                    terminal
+                )
+
+                for (
+                    encoded_state,
+                    policy,
+                ) in trajectory:
+                    replay.push(
+                        encoded_state,
+                        policy,
+                        terminal_value,
+                        perf,
+                    )
+
+                valid_episodes += 1
+
+                if len(replay) >= batch_size:
+                    for _ in range(
+                        updates_per_episode
+                    ):
+                        batch = replay.sample(
+                            batch_size
+                        )
+
+                        losses = (
+                            network.train_step(
+                                optimizer,
+                                *batch,
+                            )
+                        )
+
+                        optimizer_updates += 1
             else:
-                print(f"       [Step {step+1}] AI chosen action -> Device: {best_action[0].upper()}, Bus: {best_action[1]}")
+                invalid_episodes += 1
 
-            state, reward, is_infeasible_done, info = env.step(best_action)
-            msg = info.get("msg", "")
+            summary = terminal[
+                "compliance"
+            ]["summary"]
 
-            if is_infeasible_done:
-                if "Feasible" in msg:
-                    gap = verify_exact_physics(env.base_model)
-                    actual_perf = calculate_performance_index(env.base_model)
-                    episode_memory[-1][3] = actual_perf
-                    final_cost = info.get('cost', base_cost)
-                    print(f"       Optimal Design Reached! Cost: ${final_cost:,.0f} | Gap: {gap:.2e} | Violations: {actual_perf:.4f}")
-                else:
-                    print(f"       Blackout! Physical limits exceeded. Solver hit '{msg}'.")
-                    episode_memory[-1][3] = 100.0
-                    final_cost = base_cost * (1.5 - (step * 0.05))
-                break 
+            economic_cost = float(
+                terminal["economic_cost"]
+            )
 
-            step += 1
-            
-        # Piecewise
-        LAMBDA_V = 100000.0      
-        LAMBDA_GAP = 5000000.0   
-        
-        MIN_FEASIBLE_COST = 100000.0   
-        MAX_FEASIBLE_COST = 3000000.0  
+            cost_change_percent = (
+                (
+                    economic_cost
+                    - base_economic_cost
+                )
+                / base_economic_cost
+                * 100.0
+                if np.isfinite(
+                    economic_cost
+                )
+                else float("inf")
+            )
 
-        for seq in episode_memory:
-            s_tensor, t_policy, _, target_perf = seq
-            
-            effective_perf = 0.0 if target_perf < 1e-4 else target_perf
-            effective_gap = 0.0 if gap < 1e-3 else gap  
-            
-            if effective_perf > 0.0 or effective_gap > 0.0:
-                penalty = (LAMBDA_V * effective_perf) + (LAMBDA_GAP * effective_gap)
-                scaled_value = max(-1.0, - (penalty / 500000.0))
-            else:
-                scaled_value = 1.0 - ((final_cost - MIN_FEASIBLE_COST) / (MAX_FEASIBLE_COST - MIN_FEASIBLE_COST))
-                scaled_value = max(0.0, min(1.0, scaled_value))
-                
-            buffer.push(s_tensor, t_policy, scaled_value, effective_perf)
-        
-        ep_tot_loss, ep_p_loss, ep_v_loss = 0.0, 0.0, 0.0
-        
-        
-        if len(buffer) > 256:
-            epochs_per_episode = 3 
-            tot_losses, p_losses, v_losses = [], [], []
-            for _ in range(epochs_per_episode):
-                states, target_pis, target_values, target_perfs = buffer.sample(256)
-                tl, pl, vl = net.train_step(optimizer, states, target_pis, target_values, target_perfs)
-                tot_losses.append(tl)
-                p_losses.append(pl)
-                v_losses.append(vl)
-                
-            ep_tot_loss = sum(tot_losses) / len(tot_losses)
-            ep_p_loss = sum(p_losses) / len(p_losses)
-            ep_v_loss = sum(v_losses) / len(v_losses)
-            print(f"    [NN Update] Average Loss: {ep_tot_loss:.4f} (Policy: {ep_p_loss:.4f}, Value: {ep_v_loss:.4f})")
+            episode_elapsed = (
+                perf_counter()
+                - episode_start
+            )
 
-        training_history.append({
-            'Episode': ep + 1,
-            'Temperature': round(current_temp, 3),
-            'Final_Cost($)': round(final_cost, 2),
-            'Violations(p.u.)': round(actual_perf, 4),
-            'Total_Loss': round(ep_tot_loss, 4),
-            'Policy_Loss': round(ep_p_loss, 4),
-            'Value_Loss': round(ep_v_loss, 4)
-        })
+            row = {
+                "episode": episode,
+                "seed": seed,
+                "moves": len(trajectory),
+                "selected_stop": stopped,
+                "terminal_value": (
+                    terminal_value
+                ),
+                "solver_ok": terminal[
+                    "solver_ok"
+                ],
+                "compliant": terminal[
+                    "is_compliant"
+                ],
+                "sample_used": sample_used,
+                "economic_cost": (
+                    economic_cost
+                ),
+                "cost_change_percent_vs_base": (
+                    cost_change_percent
+                ),
+                "objective_cost": terminal.get(
+                    "objective_cost"
+                ),
+                "penalty_cost": terminal.get(
+                    "penalty_cost"
+                ),
+                "placement": repr(
+                    terminal.get(
+                        "placement",
+                        {},
+                    )
+                ),
+                "placement_ieee": repr(
+                    terminal.get(
+                        "placement_ieee",
+                        {},
+                    )
+                ),
+                "termination_condition": (
+                    terminal.get(
+                        "termination_condition"
+                    )
+                ),
+                "failure_reasons": (
+                    summary.get(
+                        "failure_reasons",
+                        "",
+                    )
+                ),
+                "max_cone_abs_gap": (
+                    summary.get(
+                        "max_cone_abs_gap"
+                    )
+                ),
+                "nonexact_cone_points": (
+                    summary.get(
+                        "nonexact_cone_points"
+                    )
+                ),
+                "min_voltage_pu": (
+                    summary.get(
+                        "min_voltage_pu"
+                    )
+                ),
+                "res_curtailment_mwh_representative": (
+                    summary.get(
+                        "res_curtailment_mwh_representative"
+                    )
+                ),
+                "load_shedding_mwh_representative": (
+                    summary.get(
+                        "load_shedding_mwh_representative"
+                    )
+                ),
+                "valid_episodes_cumulative": (
+                    valid_episodes
+                ),
+                "invalid_episodes_cumulative": (
+                    invalid_episodes
+                ),
+                "replay_samples": len(
+                    replay
+                ),
+                "optimizer_updates_cumulative": (
+                    optimizer_updates
+                ),
+                "physics_solves_cumulative": (
+                    env.physics_solve_count
+                ),
+                "episode_elapsed_seconds": (
+                    episode_elapsed
+                ),
+                "loss_total": (
+                    None
+                    if losses is None
+                    else losses["total"]
+                ),
+            }
 
-        if (ep + 1) % checkpoint_interval == 0:
-            checkpoint_name = f"trained_adn_net_checkpoint_ep{ep+1}.pth"
-            torch.save(net.state_dict(), checkpoint_name)
-            print(f"    [CHECKPOINT] Model saved safely to {checkpoint_name}")
+            writer.writerow(row)
+            log_handle.flush()
 
-    print("\n  Training Complete! Saving final models and logs...")
-    final_model_name = f"trained_adn_net_ep{total_eps}.pth"
-    torch.save(net.state_dict(), final_model_name)
-    print(f" Final weights saved as: {final_model_name}")
-    
-    df = pd.DataFrame(training_history)
-    csv_filename = f"training_log_{start_ep+1}_to_{total_eps}.csv"
-    df.to_csv(csv_filename, index=False)
-    print(f" [!] Learning Curve Data successfully exported to: {csv_filename}")
+            print(
+                (
+                    f"Episode {episode}/{episodes} | "
+                    f"solver_ok={terminal['solver_ok']} | "
+                    f"compliant={terminal['is_compliant']} | "
+                    f"sample_used={sample_used} | "
+                    f"moves={len(trajectory)} | "
+                    f"cost={economic_cost:.6f} | "
+                    f"elapsed={episode_elapsed:.1f}s"
+                ),
+                flush=True,
+            )
+
+            should_save_periodic = bool(
+                checkpoint_interval > 0
+                and episode
+                % checkpoint_interval
+                == 0
+                and valid_episodes > 0
+                and len(replay) > 0
+            )
+
+            if should_save_periodic:
+                periodic_path = (
+                    output
+                    / (
+                        f"adn_{ARCHITECTURE_VERSION}"
+                        f"_seed{seed}_{stamp}"
+                        f"_episode{episode:04d}.pth"
+                    )
+                )
+
+                payload = (
+                    build_checkpoint_payload(
+                        network=network,
+                        optimizer=optimizer,
+                        seed=seed,
+                        episode=episode,
+                        configured_episodes=(
+                            episodes
+                        ),
+                        valid_episodes=(
+                            valid_episodes
+                        ),
+                        invalid_episodes=(
+                            invalid_episodes
+                        ),
+                        replay_samples=len(
+                            replay
+                        ),
+                        optimizer_updates=(
+                            optimizer_updates
+                        ),
+                        base_economic_cost=(
+                            base_economic_cost
+                        ),
+                        simulations=(
+                            simulations
+                        ),
+                        max_moves=max_moves,
+                        batch_size=batch_size,
+                        updates_per_episode=(
+                            updates_per_episode
+                        ),
+                        stop_prior_floor=(
+                            stop_prior_floor
+                        ),
+                    )
+                )
+
+                save_checkpoint_atomic(
+                    periodic_path,
+                    payload,
+                )
+
+                print(
+                    (
+                        "Periodic checkpoint: "
+                        f"{periodic_path}"
+                    ),
+                    flush=True,
+                )
+
+    if (
+        valid_episodes > 0
+        and len(replay) > 0
+    ):
+        final_checkpoint = (
+            output
+            / (
+                f"adn_{ARCHITECTURE_VERSION}"
+                f"_seed{seed}_{stamp}"
+                "_final.pth"
+            )
+        )
+
+        final_payload = (
+            build_checkpoint_payload(
+                network=network,
+                optimizer=optimizer,
+                seed=seed,
+                episode=episodes,
+                configured_episodes=episodes,
+                valid_episodes=(
+                    valid_episodes
+                ),
+                invalid_episodes=(
+                    invalid_episodes
+                ),
+                replay_samples=len(replay),
+                optimizer_updates=(
+                    optimizer_updates
+                ),
+                base_economic_cost=(
+                    base_economic_cost
+                ),
+                simulations=simulations,
+                max_moves=max_moves,
+                batch_size=batch_size,
+                updates_per_episode=(
+                    updates_per_episode
+                ),
+                stop_prior_floor=(
+                    stop_prior_floor
+                ),
+            )
+        )
+
+        save_checkpoint_atomic(
+            final_checkpoint,
+            final_payload,
+        )
+
+    return final_checkpoint, log_path
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--episodes",
+        type=int,
+        default=400,
+    )
+
+    parser.add_argument(
+        "--simulations",
+        type=int,
+        default=500,
+    )
+
+    parser.add_argument(
+        "--max-moves",
+        type=int,
+        default=32,
+    )
+
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+    )
+
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=32,
+    )
+
+    parser.add_argument(
+        "--updates-per-episode",
+        type=int,
+        default=4,
+    )
+
+    parser.add_argument(
+        "--output-dir",
+        default="models",
+    )
+
+    parser.add_argument(
+        "--checkpoint-interval",
+        type=int,
+        default=10,
+    )
+
+    parser.add_argument(
+        "--stop-prior-floor",
+        type=float,
+        default=0.05,
+    )
+
+    return parser.parse_args()
+
 
 if __name__ == "__main__":
-    self_play(start_ep=0, total_eps=200, resume_model=None)
+    args = parse_args()
+
+    model_path, log_path = train_from_scratch(
+        episodes=args.episodes,
+        simulations=args.simulations,
+        max_moves=args.max_moves,
+        seed=args.seed,
+        batch_size=args.batch_size,
+        updates_per_episode=(
+            args.updates_per_episode
+        ),
+        output_dir=args.output_dir,
+        checkpoint_interval=(
+            args.checkpoint_interval
+        ),
+        stop_prior_floor=(
+            args.stop_prior_floor
+        ),
+    )
+
+    if model_path is None:
+        print(
+            "No checkpoint was created because no valid "
+            "training sample was produced."
+        )
+    else:
+        print(
+            f"Final checkpoint: {model_path}"
+        )
+
+    print(f"Training log: {log_path}")
